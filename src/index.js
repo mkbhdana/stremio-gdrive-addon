@@ -766,22 +766,62 @@ async function fetchTmdbList(listId) {
     throw new Error("TMDB API key is required to fetch lists");
   }
 
-  const url = API_ENDPOINTS.TMDB_LIST.replace("{listId}", listId).replace(
-    "{apiKey}",
-    CONFIG.tmdbApiKey
-  );
+  let allItems = [];
+  let page = 1;
+  let totalPages = 1;
 
-  console.log({ message: "Fetching TMDB list", listId, url });
+  // Fetch all pages of the list
+  do {
+    const url = new URL(
+      API_ENDPOINTS.TMDB_LIST.replace("{listId}", listId).replace(
+        "{apiKey}",
+        CONFIG.tmdbApiKey
+      )
+    );
+    url.searchParams.set("page", page.toString());
 
-  const response = await fetch(url);
+    console.log({
+      message: "Fetching TMDB list",
+      listId,
+      page,
+      url: url.toString(),
+    });
 
-  if (!response.ok) {
-    let err = await response.text();
-    throw new Error(`${response.status} - ${response.statusText}: ${err}`);
-  }
+    const response = await fetch(url.toString());
 
-  const data = await response.json();
-  return data;
+    if (!response.ok) {
+      let err = await response.text();
+      throw new Error(`${response.status} - ${response.statusText}: ${err}`);
+    }
+
+    const data = await response.json();
+    const pageItems = data.items || [];
+    allItems = [...allItems, ...pageItems];
+    totalPages = data.total_pages || 1;
+    page++;
+
+    console.log({
+      message: "Fetched TMDB list page",
+      listId,
+      page: page - 1,
+      itemsOnPage: pageItems.length,
+      totalItems: allItems.length,
+      totalPages,
+    });
+  } while (page <= totalPages);
+
+  console.log({
+    message: "Fetched all TMDB list pages",
+    listId,
+    totalItems: allItems.length,
+    totalPages,
+  });
+
+  return {
+    items: allItems,
+    total_pages: totalPages,
+    total_results: allItems.length,
+  };
 }
 
 async function getTmdbCatalogItems(listLinks, type) {
@@ -1090,12 +1130,13 @@ async function handleRequest(request) {
         { name: "stream", types: ["movie", "series", "anime"] },
       ];
 
-      // Add TMDB catalogs as main catalogs if list links or account ID is provided
-      if (
+      const tmdbDetail =
         CONFIG.tmdbApiKey &&
         CONFIG.tmdbListLinks &&
-        CONFIG.tmdbListLinks.length > 0
-      ) {
+        CONFIG.tmdbListLinks.length > 0;
+
+      // Add TMDB catalogs as main catalogs if list links or account ID is provided
+      if (tmdbDetail) {
         // Add movie catalog if there are any movie lists
         manifest.catalogs.push({
           type: "movie",
@@ -1108,16 +1149,6 @@ async function handleRequest(request) {
           type: "series",
           id: "tmdb_series",
           name: CONFIG.addonName,
-        });
-
-        manifest.resources.push({
-          name: "catalog",
-          types: ["movie", "series"],
-        });
-        manifest.resources.push({
-          name: "meta",
-          types: ["movie", "series"],
-          idPrefixes: ["tmdb:"],
         });
       }
 
@@ -1142,15 +1173,19 @@ async function handleRequest(request) {
           ],
         });
       }
-      if (CONFIG.enableVideoCatalog || CONFIG.enableSearchCatalog) {
+      if (
+        CONFIG.enableVideoCatalog ||
+        CONFIG.enableSearchCatalog ||
+        tmdbDetail
+      ) {
         manifest.resources.push({
           name: "catalog",
-          types: ["movie"],
+          types: tmdbDetail ? ["movie", "series"] : ["movie"],
         });
         manifest.resources.push({
           name: "meta",
           types: ["movie", "series", "anime"],
-          idPrefixes: ["gdrive:"],
+          idPrefixes: tmdbDetail ? ["gdrive:", "tmdb:"] : ["gdrive:"],
         });
       }
       return createJsonResponse(manifest);
