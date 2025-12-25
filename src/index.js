@@ -353,6 +353,14 @@ function createErrorStream(description) {
 
 function sortParsedFiles(parsedFiles) {
   parsedFiles.sort((a, b) => {
+    // Prioritize drives: "My Drive" and "Root" first
+    const drivePriority = { "My Drive": 0, Root: 1, Unknown: 2 };
+    const aDrivePriority = drivePriority[a.drives] ?? 2;
+    const bDrivePriority = drivePriority[b.drives] ?? 2;
+    if (aDrivePriority !== bDrivePriority) {
+      return aDrivePriority - bDrivePriority;
+    }
+
     const languageComparison = compareLanguages(a, b);
     if (languageComparison !== 0) return languageComparison;
 
