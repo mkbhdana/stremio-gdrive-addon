@@ -31,7 +31,7 @@ const CONFIG = {
   strictTitleCheck: false,
   tmdbApiKey: null,
   enableSearchCatalog: true,
-  enableVideoCatalog: true,
+  enableVideoCatalog: false,
   maxFilesToFetch: 1000,
   driveQueryTerms: {
     episodeFormat: "fullText",
@@ -39,6 +39,7 @@ const CONFIG = {
   },
   driveFolderIds: [],
   driveIds: [],
+  tmdbListLinks: [],
 };
 
 const MANIFEST = {
@@ -74,14 +75,15 @@ const API_ENDPOINTS = {
   TMDB_FIND:
     "https://api.themoviedb.org/3/find/{id}?api_key={apiKey}&external_source=imdb_id",
   TMDB_DETAILS: "https://api.themoviedb.org/3/{type}/{id}?api_key={apiKey}",
+  TMDB_LIST: "https://api.themoviedb.org/3/list/{listId}?api_key={apiKey}",
 };
 
 const REGEX_PATTERNS = {
   validStreamRequest: /\/stream\/(movie|series)\/([a-zA-Z0-9%:\-_]+)\.json/,
   validPlaybackRequest: /\/playback\/([a-zA-Z0-9%:\-_]+)\/(.+)/,
   validCatalogRequest:
-    /\/catalog\/movie\/([a-zA-Z0-9%:\-_]+)(\/search=(.+))?\.json/,
-  validMetaRequest: /\/meta\/(movie)\/([a-zA-Z0-9%:\-_]+)\.json/,
+    /\/catalog\/(movie|series)\/([a-zA-Z0-9%:\-_]+)(\/search=(.+))?\.json/,
+  validMetaRequest: /\/meta\/(movie|series)\/([a-zA-Z0-9%:\-_]+)\.json/,
   resolutions: {
     "2160p": /(?<![^ [(_\-.])(4k|2160p|uhd)(?=[ \)\]_.-]|$)/i,
     "1080p": /(?<![^ [(_\-.])(1080p|fhd)(?=[ \)\]_.-]|$)/i,
@@ -271,7 +273,7 @@ function compareByField(a, b, field) {
 function createStream(parsedFile, accessToken) {
   let name = parsedFile.type.startsWith("audio")
     ? `[🎵 Audio] ${MANIFEST.name} ${parsedFile.extension.toUpperCase()}`
-    : `${MANIFEST.name} ${parsedFile.resolution}`;
+    : `${MANIFEST.name} ${parsedFile.resolution} | ${parsedFile.drives}`;
 
   let description = `🎥 ${parsedFile.quality}   ${
     parsedFile.encode ? "🎞️ " + parsedFile.encode : ""
@@ -733,6 +735,119 @@ async function getImdbSuggestionMeta(id) {
   };
 }
 
+function extractListId(listLink) {
+  // Extract list ID from URL or return as-is if it's already an ID
+  if (typeof listLink !== "string") return null;
+
+  // If it's a URL, extract the ID
+  const urlMatch = listLink.match(/list\/(\d+)/);
+  if (urlMatch) {
+    return urlMatch[1];
+  }
+
+  // If it's just a number, return it
+  if (/^\d+$/.test(listLink)) {
+    return listLink;
+  }
+
+  return null;
+}
+
+async function fetchTmdbList(listId) {
+  if (!CONFIG.tmdbApiKey) {
+    throw new Error("TMDB API key is required to fetch lists");
+  }
+
+  const url = API_ENDPOINTS.TMDB_LIST.replace("{listId}", listId).replace(
+    "{apiKey}",
+    CONFIG.tmdbApiKey
+  );
+
+  console.log({ message: "Fetching TMDB list", listId, url });
+
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    let err = await response.text();
+    throw new Error(`${response.status} - ${response.statusText}: ${err}`);
+  }
+
+  const data = await response.json();
+  return data;
+}
+
+async function getTmdbCatalogItems(listLinks, type) {
+  const allItems = [];
+
+  // If no list links provided, return empty
+  if (!listLinks || listLinks.length === 0) {
+    return [];
+  }
+
+  for (const listLink of listLinks) {
+    const listId = extractListId(listLink);
+    if (!listId) {
+      console.warn({ message: "Invalid list link", listLink });
+      continue;
+    }
+
+    try {
+      const listData = await fetchTmdbList(listId);
+
+      if (!listData?.items) {
+        console.warn({ message: "No items in list", listId });
+        continue;
+      }
+
+      // Filter items by type (movie or tv)
+      const filteredItems = listData.items.filter((item) => {
+        if (type === "movie") {
+          return item.media_type === "movie";
+        } else if (type === "series") {
+          return item.media_type === "tv";
+        }
+        return true;
+      });
+
+      // Convert to Stremio catalog format
+      const catalogItems = filteredItems.map((item) => {
+        const releaseDate = item.release_date || item.first_air_date;
+        const year = releaseDate ? releaseDate.split("-")[0] : null;
+
+        return {
+          id: `tmdb:${item.id}`,
+          type: item.media_type === "movie" ? "movie" : "series",
+          name: item.title || item.name,
+          poster: item.poster_path
+            ? `https://image.tmdb.org/t/p/w500${item.poster_path}`
+            : null,
+          background: item.backdrop_path
+            ? `https://image.tmdb.org/t/p/w1280${item.backdrop_path}`
+            : null,
+          posterShape: "regular",
+          description: item.overview || "",
+          releaseInfo: year || "",
+        };
+      });
+
+      allItems.push(...catalogItems);
+    } catch (error) {
+      console.error({
+        message: "Error fetching TMDB list",
+        listId,
+        error: error.toString(),
+      });
+    }
+  }
+
+  // Remove duplicates based on ID
+  const uniqueItems = Array.from(
+    new Map(allItems.map((item) => [item.id, item])).values()
+  );
+
+  return uniqueItems;
+}
+
 async function getAccessToken() {
   const params = new URLSearchParams({
     client_id: CREDENTIALS.clientId,
@@ -966,14 +1081,47 @@ async function handleRequest(request) {
       manifest.resources = [
         { name: "stream", types: ["movie", "series", "anime"] },
       ];
-      if (CONFIG.enableSearchCatalog) {
+
+      // Add TMDB catalogs as main catalogs if list links or account ID is provided
+      if (
+        CONFIG.tmdbApiKey &&
+        CONFIG.tmdbListLinks &&
+        CONFIG.tmdbListLinks.length > 0
+      ) {
+        // Add movie catalog if there are any movie lists
+        manifest.catalogs.push({
+          type: "movie",
+          id: "tmdb_movies",
+          name: CONFIG.addonName,
+        });
+
+        // Add series catalog if there are any series lists
+        manifest.catalogs.push({
+          type: "series",
+          id: "tmdb_series",
+          name: CONFIG.addonName,
+        });
+
+        manifest.resources.push({
+          name: "catalog",
+          types: ["movie", "series"],
+        });
+        manifest.resources.push({
+          name: "meta",
+          types: ["movie", "series"],
+          idPrefixes: ["tmdb:"],
+        });
+      }
+
+      // Keep GDrive search catalog
+      if (CONFIG.enableVideoCatalog) {
         manifest.catalogs.push({
           type: "movie",
           id: "gdrive_list",
           name: "Google Drive",
         });
       }
-      if (CONFIG.enableVideoCatalog) {
+      if (CONFIG.enableSearchCatalog) {
         manifest.catalogs.push({
           type: "movie",
           id: "gdrive_search",
@@ -1053,6 +1201,7 @@ async function handleRequest(request) {
     });
 
     if (metaMatch) {
+      const metaType = metaMatch[1]; // movie or series
       const fileId = metaMatch[2];
       if (!fileId) {
         console.error({
@@ -1061,6 +1210,76 @@ async function handleRequest(request) {
         });
         return null;
       }
+
+      // Handle TMDB meta requests
+      if (fileId.startsWith("tmdb:")) {
+        const tmdbId = fileId.split(":")[1];
+        if (!CONFIG.tmdbApiKey) {
+          return createJsonResponse({
+            error: "TMDB API key is required for TMDB meta",
+          });
+        }
+
+        try {
+          const url = API_ENDPOINTS.TMDB_DETAILS.replace(
+            "{type}",
+            metaType === "movie" ? "movie" : "tv"
+          )
+            .replace("{id}", tmdbId)
+            .replace("{apiKey}", CONFIG.tmdbApiKey);
+
+          console.log({
+            message: "Fetching TMDB meta",
+            type: metaType,
+            id: tmdbId,
+            url,
+          });
+
+          const response = await fetch(url);
+          if (!response.ok) {
+            let err = await response.text();
+            throw new Error(
+              `${response.status} - ${response.statusText}: ${err}`
+            );
+          }
+
+          const data = await response.json();
+          const releaseDate = data.release_date || data.first_air_date;
+          const year = releaseDate ? releaseDate.split("-")[0] : null;
+
+          return createJsonResponse({
+            meta: {
+              id: `tmdb:${tmdbId}`,
+              type: metaType,
+              name: data.title || data.name,
+              poster: data.poster_path
+                ? `https://image.tmdb.org/t/p/w500${data.poster_path}`
+                : null,
+              background: data.backdrop_path
+                ? `https://image.tmdb.org/t/p/w1280${data.backdrop_path}`
+                : null,
+              posterShape: "regular",
+              description: data.overview || "",
+              releaseInfo: year || "",
+              genres: data.genres?.map((g) => g.name) || [],
+              runtime: data.runtime || data.episode_run_time?.[0] || null,
+              imdbRating: data.vote_average
+                ? data.vote_average.toFixed(1)
+                : null,
+            },
+          });
+        } catch (error) {
+          console.error({
+            message: "Error fetching TMDB meta",
+            error: error.toString(),
+          });
+          return createJsonResponse({
+            error: "Failed to fetch TMDB meta",
+          });
+        }
+      }
+
+      // Handle GDrive meta requests (existing code)
       const gdriveId = fileId.split(":")[1];
       const accessToken = await getAccessToken();
       if (!accessToken) {
@@ -1094,11 +1313,43 @@ async function handleRequest(request) {
 
     if (catalogMatch) {
       // handle catalogs
-      const catalogId = catalogMatch[1];
-      const searchQuery = catalogMatch[2];
+      const catalogType = catalogMatch[1]; // movie or series
+      const catalogId = catalogMatch[2];
+      const searchQuery = catalogMatch[3];
       const searchTerm = searchQuery ? searchQuery.split("=")[1] : null;
 
-      console.log({ message: "Catalog request", catalogId, searchTerm });
+      console.log({
+        message: "Catalog request",
+        catalogType,
+        catalogId,
+        searchTerm,
+      });
+
+      // Handle TMDB catalogs
+      if (catalogId === "tmdb_movies" || catalogId === "tmdb_series") {
+        if (!CONFIG.tmdbApiKey) {
+          return createJsonResponse({
+            error: "TMDB API key is required for TMDB catalogs",
+          });
+        }
+
+        if (!CONFIG.tmdbListLinks || CONFIG.tmdbListLinks.length === 0) {
+          return createJsonResponse({
+            error: "No TMDB list links configured. Provide tmdbListLinks",
+          });
+        }
+
+        const type = catalogId === "tmdb_movies" ? "movie" : "series";
+        const items = await getTmdbCatalogItems(CONFIG.tmdbListLinks, type);
+
+        console.log({
+          message: "TMDB catalog response",
+          type,
+          numItems: items.length,
+        });
+
+        return createJsonResponse({ metas: items });
+      }
 
       if (catalogId === "gdrive_list") {
         const parts = ["trashed=false", "mimeType contains 'video/'"];
@@ -1403,6 +1654,14 @@ export default {
     CREDENTIALS.clientSecret = CREDENTIALS.clientSecret || env.CLIENT_SECRET;
     CREDENTIALS.refreshToken = CREDENTIALS.refreshToken || env.REFRESH_TOKEN;
     CONFIG.tmdbApiKey = CONFIG.tmdbApiKey || env.TMDB_API_KEY;
+
+    // Handle TMDB list links from environment variable (comma-separated)
+    if (env.TMDB_LIST_LINKS && !CONFIG.tmdbListLinks.length) {
+      CONFIG.tmdbListLinks = env.TMDB_LIST_LINKS.split(",").map((link) =>
+        link.trim()
+      );
+    }
+
     return handleRequest(request);
   },
 };
