@@ -47,6 +47,9 @@ const MANIFEST = {
   version: "1.0.0",
   name: CONFIG.addonName,
   description: "Stream your files from Google Drive within Stremio!",
+  logo: "https://upload.wikimedia.org/wikipedia/commons/d/da/Google_Drive_logo.png",
+  background:
+    "https://upload.wikimedia.org/wikipedia/commons/d/da/Google_Drive_logo.png",
   catalogs: [],
   resources: [
     {
@@ -743,6 +746,21 @@ async function getImdbSuggestionMeta(id) {
   };
 }
 
+function isLikelySeries(filename) {
+  // Check for series indicators in filename
+  const seriesPatterns = [
+    /\b[sS]\d+[eE]\d+\b/, // S01E01, s1e1
+    /\b\d+[xX]\d+\b/, // 1x01
+    /\bSeason\s+\d+\b/i, // Season 1
+    /\bEpisode\s+\d+\b/i, // Episode 1
+    /\bEp\s*\d+\b/i, // Ep 1
+    /\bChapter\s+\d+\b/i, // Chapter 1 (common in series)
+    /\bPart\s+\d+\b/i, // Part 1
+  ];
+
+  return seriesPatterns.some((pattern) => pattern.test(filename));
+}
+
 function extractListId(listLink) {
   // Extract list ID from URL or return as-is if it's already an ID
   if (typeof listLink !== "string") return null;
@@ -1135,14 +1153,28 @@ async function handleRequest(request) {
         CONFIG.tmdbListLinks &&
         CONFIG.tmdbListLinks.length > 0;
 
+      // Keep GDrive catalogs - separate for movies and series
+      if (CONFIG.enableVideoCatalog) {
+        manifest.catalogs.push({
+          type: "movie",
+          id: "gdrive_list",
+          name: CONFIG.addonName,
+        });
+        // manifest.catalogs.push({
+        //   type: "series",
+        //   id: "gdrive_list",
+        //   name: "Google Drive Series",
+        // });
+      }
+
       // Add TMDB catalogs as main catalogs if list links or account ID is provided
       if (tmdbDetail) {
         // Add movie catalog if there are any movie lists
-        manifest.catalogs.push({
-          type: "movie",
-          id: "tmdb_movies",
-          name: CONFIG.addonName,
-        });
+        // manifest.catalogs.push({
+        //   type: "movie",
+        //   id: "tmdb_movies",
+        //   name: CONFIG.addonName,
+        // });
 
         // Add series catalog if there are any series lists
         manifest.catalogs.push({
@@ -1152,19 +1184,22 @@ async function handleRequest(request) {
         });
       }
 
-      // Keep GDrive search catalog
-      if (CONFIG.enableVideoCatalog) {
-        manifest.catalogs.push({
-          type: "movie",
-          id: "gdrive_list",
-          name: "Google Drive",
-        });
-      }
       if (CONFIG.enableSearchCatalog) {
         manifest.catalogs.push({
           type: "movie",
           id: "gdrive_search",
-          name: "Google Drive Search",
+          name: CONFIG.addonName,
+          extra: [
+            {
+              name: "search",
+              isRequired: true,
+            },
+          ],
+        });
+        manifest.catalogs.push({
+          type: "series",
+          id: "gdrive_search",
+          name: CONFIG.addonName,
           extra: [
             {
               name: "search",
@@ -1180,12 +1215,12 @@ async function handleRequest(request) {
       ) {
         manifest.resources.push({
           name: "catalog",
-          types: tmdbDetail ? ["movie", "series"] : ["movie"],
+          types: ["movie", "series"],
         });
         manifest.resources.push({
           name: "meta",
           types: ["movie", "series", "anime"],
-          idPrefixes: tmdbDetail ? ["gdrive:", "tmdb:"] : ["gdrive:"],
+          idPrefixes: ["gdrive:"],
         });
       }
       return createJsonResponse(manifest);
@@ -1225,12 +1260,19 @@ async function handleRequest(request) {
       return createProxiedStreamResponse(fileId, filename, request);
     }
 
-    const createMetaObject = (id, name, size, thumbnail, createdTime) => ({
+    const createMetaObject = (
+      id,
+      name,
+      size,
+      thumbnail,
+      createdTime,
+      type = "movie"
+    ) => ({
       id: `gdrive:${id}`,
       name,
-      posterShape: "landscape",
+      posterShape: "regular",
       background: thumbnail,
-      poster: thumbnail,
+      poster: null,
       description:
         `Size: ${formatSize(size)}` +
         (createdTime
@@ -1240,7 +1282,7 @@ async function handleRequest(request) {
               day: "numeric",
             })}`
           : ""),
-      type: "movie",
+      type: type,
     });
 
     if (metaMatch) {
@@ -1343,13 +1385,16 @@ async function handleRequest(request) {
       }
       console.log({ message: "File fetched", file });
       const parsedFile = parseFile(file);
+      // Determine type based on filename
+      const fileType = isLikelySeries(file.name) ? "series" : "movie";
       return createJsonResponse({
         meta: createMetaObject(
           parsedFile.id,
           parsedFile.name,
           parsedFile.size,
           file.thumbnailLink,
-          file.createdTime
+          file.createdTime,
+          fileType
         ),
       });
     }
@@ -1395,25 +1440,39 @@ async function handleRequest(request) {
       }
 
       if (catalogId === "gdrive_list") {
+        // For series, use TMDB catalog from tmdbListLinks
+        if (catalogType === "series") {
+          if (!CONFIG.tmdbApiKey) {
+            return createJsonResponse({
+              error: "TMDB API key is required for series catalog",
+            });
+          }
+
+          if (!CONFIG.tmdbListLinks || CONFIG.tmdbListLinks.length === 0) {
+            return createJsonResponse({
+              error: "No TMDB list links configured. Provide tmdbListLinks",
+            });
+          }
+
+          const items = await getTmdbCatalogItems(
+            CONFIG.tmdbListLinks,
+            "series"
+          );
+
+          console.log({
+            message: "GDrive series catalog (TMDB)",
+            numItems: items.length,
+          });
+
+          return createJsonResponse({ metas: items });
+        }
+
+        // For movies, use GDrive files
         const parts = ["trashed=false", "mimeType contains 'video/'"];
         if (CONFIG.driveFolderIds && CONFIG.driveFolderIds.length > 0) {
           const ors = CONFIG.driveFolderIds.map((id) => `'${id}' in parents`);
           parts.push(`(${ors.join(" or ")})`);
         }
-
-        const queryParams = {
-          q: parts.join(" and "),
-          corpora: "allDrives",
-          includeItemsFromAllDrives: "true",
-          supportsAllDrives: "true",
-          pageSize: "1000",
-          orderBy: "createdTime desc",
-          fields:
-            "nextPageToken,incompleteSearch,files(id,name,size,videoMediaMetadata,mimeType,fileExtension,thumbnailLink,createdTime,driveId)",
-        };
-
-        const fetchUrl = new URL(API_ENDPOINTS.DRIVE_FETCH_FILES);
-        fetchUrl.search = new URLSearchParams(queryParams).toString();
 
         const accessToken = await getAccessToken();
 
@@ -1424,18 +1483,84 @@ async function handleRequest(request) {
           });
         }
 
-        const results = await fetchFiles(fetchUrl, accessToken);
-        const metas = results.files.map((file) =>
+        let allFiles = [];
+
+        // If driveIds are provided, only search those specific drives
+        if (CONFIG.driveIds && CONFIG.driveIds.length > 0) {
+          console.log({
+            message: "Searching specific drives for catalog",
+            driveIds: CONFIG.driveIds,
+          });
+
+          // Query each drive separately and combine results
+          for (const driveId of CONFIG.driveIds) {
+            const queryParams = {
+              q: parts.join(" and "),
+              corpora: "drive",
+              driveId: driveId,
+              includeItemsFromAllDrives: "true",
+              supportsAllDrives: "true",
+              pageSize: "1000",
+              orderBy: "createdTime desc",
+              fields:
+                "nextPageToken,incompleteSearch,files(id,name,size,videoMediaMetadata,mimeType,fileExtension,thumbnailLink,createdTime,driveId)",
+            };
+
+            const fetchUrl = new URL(API_ENDPOINTS.DRIVE_FETCH_FILES);
+            fetchUrl.search = new URLSearchParams(queryParams).toString();
+
+            const driveResults = await fetchFiles(fetchUrl, accessToken);
+            if (driveResults?.files) {
+              allFiles = [...allFiles, ...driveResults.files];
+            }
+          }
+        } else {
+          // If no driveIds specified, search all drives (backward compatibility)
+          const queryParams = {
+            q: parts.join(" and "),
+            corpora: "allDrives",
+            includeItemsFromAllDrives: "true",
+            supportsAllDrives: "true",
+            pageSize: "1000",
+            orderBy: "createdTime desc",
+            fields:
+              "nextPageToken,incompleteSearch,files(id,name,size,videoMediaMetadata,mimeType,fileExtension,thumbnailLink,createdTime,driveId)",
+          };
+
+          const fetchUrl = new URL(API_ENDPOINTS.DRIVE_FETCH_FILES);
+          fetchUrl.search = new URLSearchParams(queryParams).toString();
+
+          const driveResults = await fetchFiles(fetchUrl, accessToken);
+          allFiles = driveResults?.files || [];
+        }
+
+        const results = { files: allFiles };
+
+        // Filter files - exclude series files for movies
+        const filteredFiles = results.files.filter((file) => {
+          return !isLikelySeries(file.name);
+        });
+
+        console.log({
+          message: "GDrive catalog filtered",
+          catalogType,
+          totalFiles: results.files.length,
+          filteredFiles: filteredFiles.length,
+        });
+
+        const metas = filteredFiles.map((file) =>
           createMetaObject(
             file.id,
             file.name,
             file.size,
             file.thumbnailLink,
-            file.createdTime
+            file.createdTime,
+            catalogType
           )
         );
         console.log({
           message: "Catalog response",
+          catalogType,
           numMetas: metas.length,
         });
         return createJsonResponse({ metas });
@@ -1446,19 +1571,43 @@ async function handleRequest(request) {
           return createJsonResponse({ metas: [] });
         }
 
-        const queryParams = {
-          q: buildBaseSearchQuery(decodeURIComponent(searchTerm)),
-          corpora: "allDrives",
-          includeItemsFromAllDrives: "true",
-          supportsAllDrives: "true",
-          pageSize: "1000",
-          fields:
-            "files(id,name,size,videoMediaMetadata,mimeType,fileExtension,thumbnailLink,createdTime,driveId)",
-        };
+        // For series, use TMDB catalog from tmdbListLinks and filter by search term
+        if (catalogType === "series") {
+          if (!CONFIG.tmdbApiKey) {
+            return createJsonResponse({
+              error: "TMDB API key is required for series search",
+            });
+          }
 
-        const fetchUrl = new URL(API_ENDPOINTS.DRIVE_FETCH_FILES);
-        fetchUrl.search = new URLSearchParams(queryParams).toString();
+          if (!CONFIG.tmdbListLinks || CONFIG.tmdbListLinks.length === 0) {
+            return createJsonResponse({
+              error: "No TMDB list links configured. Provide tmdbListLinks",
+            });
+          }
 
+          const allItems = await getTmdbCatalogItems(
+            CONFIG.tmdbListLinks,
+            "series"
+          );
+
+          // Filter by search term (case-insensitive)
+          const searchLower = decodeURIComponent(searchTerm).toLowerCase();
+          const filteredItems = allItems.filter((item) => {
+            const name = (item.name || "").toLowerCase();
+            return name.includes(searchLower);
+          });
+
+          console.log({
+            message: "GDrive series search (TMDB)",
+            searchTerm,
+            totalItems: allItems.length,
+            filteredItems: filteredItems.length,
+          });
+
+          return createJsonResponse({ metas: filteredItems });
+        }
+
+        // For movies, use GDrive search
         const accessToken = await getAccessToken();
 
         if (!accessToken) {
@@ -1468,19 +1617,75 @@ async function handleRequest(request) {
           });
         }
 
-        const results = await fetchFiles(fetchUrl, accessToken);
+        let allFiles = [];
+
+        // If driveIds are provided, only search those specific drives
+        if (CONFIG.driveIds && CONFIG.driveIds.length > 0) {
+          console.log({
+            message: "Searching specific drives for catalog search",
+            driveIds: CONFIG.driveIds,
+            searchTerm,
+          });
+
+          // Query each drive separately and combine results
+          for (const driveId of CONFIG.driveIds) {
+            const queryParams = {
+              q: buildBaseSearchQuery(decodeURIComponent(searchTerm)),
+              corpora: "drive",
+              driveId: driveId,
+              includeItemsFromAllDrives: "true",
+              supportsAllDrives: "true",
+              pageSize: "1000",
+              fields:
+                "files(id,name,size,videoMediaMetadata,mimeType,fileExtension,thumbnailLink,createdTime,driveId)",
+            };
+
+            const fetchUrl = new URL(API_ENDPOINTS.DRIVE_FETCH_FILES);
+            fetchUrl.search = new URLSearchParams(queryParams).toString();
+
+            const driveResults = await fetchFiles(fetchUrl, accessToken);
+            if (driveResults?.files) {
+              allFiles = [...allFiles, ...driveResults.files];
+            }
+          }
+        } else {
+          // If no driveIds specified, search all drives (backward compatibility)
+          const queryParams = {
+            q: buildBaseSearchQuery(decodeURIComponent(searchTerm)),
+            corpora: "allDrives",
+            includeItemsFromAllDrives: "true",
+            supportsAllDrives: "true",
+            pageSize: "1000",
+            fields:
+              "files(id,name,size,videoMediaMetadata,mimeType,fileExtension,thumbnailLink,createdTime,driveId)",
+          };
+
+          const fetchUrl = new URL(API_ENDPOINTS.DRIVE_FETCH_FILES);
+          fetchUrl.search = new URLSearchParams(queryParams).toString();
+
+          const driveResults = await fetchFiles(fetchUrl, accessToken);
+          allFiles = driveResults?.files || [];
+        }
+
+        const results = { files: allFiles };
 
         if (!results?.files || results.files.length === 0) {
           return createJsonResponse({ metas: [] });
         }
 
-        const metas = results.files.map((file) =>
+        // Filter files - exclude series files for movies
+        const filteredFiles = results.files.filter((file) => {
+          return !isLikelySeries(file.name);
+        });
+
+        const metas = filteredFiles.map((file) =>
           createMetaObject(
             file.id,
             file.name,
             file.size,
             file.thumbnailLink,
-            file.createdTime
+            file.createdTime,
+            catalogType
           )
         );
 
@@ -1703,6 +1908,11 @@ export default {
       CONFIG.tmdbListLinks = env.TMDB_LIST_LINKS.split(",").map((link) =>
         link.trim()
       );
+    }
+
+    // Handle driveIds from environment variable (comma-separated)
+    if (env.DRIVE_IDS && !CONFIG.driveIds.length) {
+      CONFIG.driveIds = env.DRIVE_IDS.split(",").map((id) => id.trim());
     }
 
     return handleRequest(request);
