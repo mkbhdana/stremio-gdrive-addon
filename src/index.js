@@ -352,7 +352,7 @@ function compareByField(a, b, field) {
 async function createStream(parsedFile, accessToken) {
   let name = parsedFile.type.startsWith("audio")
     ? `[🎵 Audio] ${MANIFEST.name} ${parsedFile.extension.toUpperCase()}`
-    : `${MANIFEST.name} ${parsedFile.resolution}`;
+    : `${MANIFEST.name} ${parsedFile.resolution} | ${parsedFile.drives}`;
 
   let description = `🎥 ${parsedFile.quality}   ${
     parsedFile.encode ? "🎞️ " + parsedFile.encode : ""
